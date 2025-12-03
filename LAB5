@@ -1,0 +1,87 @@
+from google.colab import files
+uploaded = files.upload()
+
+!pip install sagemaker
+import sagemaker
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+
+from sagemaker import get_execution_role, image_uris
+from sagemaker.estimator import Estimator
+from sagemaker.inputs import TrainingInput
+from sagemaker.tuner import HyperparameterTuner, ContinuousParameter, IntegerParameter
+
+sess = sagemaker.Session()
+role = get_execution_role()
+bucket = sess.default_bucket()
+region = sess.boto_region_name
+prefix = "hyperparameter-tuning"
+
+data = pd.read_csv("winequality-red.csv", sep=";")
+data["label"] = (data["quality"] >= 6).astype(int)
+data = data.drop(columns=["quality"])
+X = data.drop(columns=["label"])
+y = data["label"]
+
+preprocessor = ColumnTransformer(
+    transformers=[("num", StandardScaler(), X.columns)],
+    remainder="drop"
+)
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+preprocessor.fit(X_train)
+X_train = preprocessor.transform(X_train)
+X_val   = preprocessor.transform(X_val)
+
+train = np.hstack([np.array(y_train).reshape(-1,1), X_train])
+val   = np.hstack([np.array(y_val).reshape(-1,1), X_val])
+
+np.savetxt("train.csv", train, delimiter=",")
+np.savetxt("val.csv",   val,   delimiter=",")
+
+train_s3 = sess.upload_data("train.csv", bucket=bucket, key_prefix=prefix+"/train")
+val_s3   = sess.upload_data("val.csv",   bucket=bucket, key_prefix=prefix+"/val")
+
+# XGBoost + Tuner 
+xgb_image = image_uris.retrieve("xgboost", region=region, version="1.5-1")
+
+estimator = Estimator(
+    image_uri=xgb_image,
+    role=role,
+    instance_count=1,
+    instance_type="ml.m5.large",
+    output_path=f"s3://{bucket}/{prefix}/output",
+    sagemaker_session=sess
+)
+
+estimator.set_hyperparameters(
+    objective="binary:logistic",
+    eval_metric="auc",
+    num_round=100
+)
+
+hyperparameter_ranges = {
+    "eta":       ContinuousParameter(0.01, 0.3),
+    "max_depth": IntegerParameter(3, 10),
+    "subsample": ContinuousParameter(0.5, 1.0)
+}
+
+tuner = HyperparameterTuner(
+    estimator=estimator,
+    objective_metric_name="validation:auc",
+    hyperparameter_ranges=hyperparameter_ranges,
+    max_jobs=6,
+    max_parallel_jobs=2,
+    objective_type="Maximize"
+)
+
+tuner.fit({
+    "train": TrainingInput(train_s3, content_type="text/csv"),
+    "validation": TrainingInput(val_s3, content_type="text/csv")
+})
